@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+﻿import { createHash } from 'node:crypto';
 import { setTimeout as pause } from 'node:timers/promises';
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
@@ -23,7 +23,11 @@ export async function daemonInfo(requireActor = true, path = configPath()): Prom
 export class DaemonClient {
   constructor(private info: DaemonInfo, private readonly configFile = configPath()) {}
   async request<T>(path: string, body?: unknown, timeoutMs = 600_500, signal?: AbortSignal): Promise<T> {
-    const stop = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
+    const deadline = AbortSignal.timeout(timeoutMs);
+    try { return await this.attempt<T>(path, body, signal ? AbortSignal.any([signal, deadline]) : deadline); }
+    catch (error) { if (deadline.aborted && !signal?.aborted) throw new BridgeError(0, 'DAEMON_TIMEOUT', 'The local runtime did not answer before the deadline'); throw error; }
+  }
+  private async attempt<T>(path: string, body: unknown, stop: AbortSignal): Promise<T> {
     const reconnect = path.endsWith('/watch') || path.endsWith('/pair');
     const input = reconnect ? sessionBody.parse(body) : undefined;
     const started = performance.now(), deadline = input ? started + input.timeout_ms : undefined;
@@ -33,7 +37,7 @@ export class DaemonClient {
         // Bound local long polls below native fetch's headers timeout. Keep the
         // caller's original deadline across chunks and daemon reconnections.
         const requestBody = input ? { ...input, timeout_ms: Math.min(25_000, remaining!) } : body;
-        const response = await fetch(this.info.url + path, { method: body === undefined ? 'GET' : 'POST', headers: { Authorization: `Bearer ${this.info.token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, body: body === undefined ? undefined : JSON.stringify(requestBody), signal: stop });
+        const response = await fetch(this.info.url + path, { method: requestBody === undefined ? 'GET' : 'POST', headers: { Authorization: `Bearer ${this.info.token}`, ...(requestBody === undefined ? {} : { 'Content-Type': 'application/json' }) }, body: requestBody === undefined ? undefined : JSON.stringify(requestBody), signal: stop });
         const result = await response.json() as { error?: { code: string; message: string }; timed_out?: boolean; runtime_setup_ms?: number };
         if (!response.ok) throw new BridgeError(response.status, result.error?.code ?? 'DAEMON_ERROR', result.error?.message ?? 'Local daemon request failed');
         if (input && remaining! > 25_000 && result.timed_out === true) continue;
@@ -61,8 +65,12 @@ export class DaemonClient {
     if (result.running !== true || result.version !== 1 || result.actor !== this.info.actor || result.pid !== this.info.pid || !Array.isArray(result.channels)) throw new BridgeError(0, 'DAEMON_INVALID', 'The saved port is not owned by this bridge runtime');
     return result;
   }
-  pair(channel: string, session: string, timeoutMs = 600_000, signal?: AbortSignal) { channelIdSchema.parse(channel); return this.request<RuntimePairResult>(`/v1/channels/${channel}/pair`, { session_id: session, timeout_ms: timeoutMs }, timeoutMs + 500, signal); }
-  watch(channel: string, session: string, timeoutMs = 600_000, signal?: AbortSignal) { channelIdSchema.parse(channel); return this.request<ReturnType<ChannelRuntime['inbox']> & { timed_out: boolean; channel: string; session_id: string }>(`/v1/channels/${channel}/watch`, { session_id: session, timeout_ms: timeoutMs }, timeoutMs + 500, signal); }
+  private wait<T>(channel: string, operation: 'pair' | 'watch', session: string, timeoutMs: number, signal?: AbortSignal) {
+    channelIdSchema.parse(channel);
+    return this.request<T>(`/v1/channels/${channel}/${operation}`, { session_id: session, timeout_ms: timeoutMs }, timeoutMs + 500, signal);
+  }
+  pair(channel: string, session: string, timeoutMs = 600_000, signal?: AbortSignal) { return this.wait<RuntimePairResult>(channel, 'pair', session, timeoutMs, signal); }
+  watch(channel: string, session: string, timeoutMs = 600_000, signal?: AbortSignal) { return this.wait<ReturnType<ChannelRuntime['inbox']> & { timed_out: boolean; channel: string; session_id: string }>(channel, 'watch', session, timeoutMs, signal); }
   acknowledge(channel: string, session: string, generation: string, cursor: number) { channelIdSchema.parse(channel); return this.request<{ acknowledged_cursor: number }>(`/v1/channels/${channel}/ack`, { session_id: session, generation, cursor }, 40_500); }
   leave(channel: string, session: string) { channelIdSchema.parse(channel); return this.request<{ left: true }>(`/v1/channels/${channel}/leave`, { session_id: session }, 40_500); }
   stop() { return this.request<{ stopped: true }>('/v1/stop', {}, 5000); }

@@ -134,6 +134,17 @@ test('resident receiver restores the same pairing after restart, preserves paged
   await restored.client.stop(); await restored.exited;
 });
 
+test('a watch that reconnects across a runtime restart asks for the remaining time and ends at its own deadline', { timeout: 20_000 }, async t => {
+  const h = await fixture(t), a = await h.device('laptop'), b = await h.device('vm');
+  await Promise.all([a.client.pair('4040', a.session, 5000), b.client.pair('4040', b.session, 5000)]);
+  const started = performance.now(); const watching = b.client.watch('4040', b.session, 5000);
+  await pause(300); await b.client.stop(); await b.exited;
+  const restored = await daemon(t, b.config);
+  const result = await watching;
+  assert.equal(result.timed_out, true); assert.deepEqual(result.messages, []); assert.ok(performance.now() - started < 5500);
+  await restored.client.stop(); await restored.exited;
+});
+
 test('exclusive listener rejects a concurrent owner and survives a crash without a stale lock', { timeout: 20_000 }, async t => {
   const h = await fixture(t), a = await h.device('laptop');
   const duplicate = spawn(process.execPath, ['dist/cli.js', 'daemon', 'run'], { env: { ...process.env, BRIDGE_CONFIG: a.config }, stdio: ['ignore', 'pipe', 'pipe'] });

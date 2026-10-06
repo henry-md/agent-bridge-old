@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 import { Command } from 'commander';
 import { spawn } from 'node:child_process';
 import { setTimeout as pause } from 'node:timers/promises';
@@ -117,10 +117,10 @@ channels.command('pair').description('Join and exchange the setup word in one pr
     output(await watchChannel(client, current, channel, paired.session_id, options.watchTimeout, paired.connection));
   }
 });
-channels.command('join').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID; defaults to CODEX_THREAD_ID or a saved per-channel UUID').option('--wait <seconds>', 'Wait for the mutual handshake, 0–25 seconds', wait, 25).action(async (channel, options) => {
+channels.command('join').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID; defaults to CODEX_THREAD_ID or a saved per-channel UUID').option('--wait <seconds>', 'Wait for the mutual handshake, 0â€“25 seconds', wait, 25).action(async (channel, options) => {
   const { config, client } = await localClient(); output(channelResult(await joinChannel(client, config, channel, options.session, options.wait)));
 });
-channels.command('status').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').option('--wait <seconds>', 'Long poll wait, 0–25 seconds', wait, 0).action(async (channel, options) => {
+channels.command('status').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').option('--wait <seconds>', 'Long poll wait, 0â€“25 seconds', wait, 0).action(async (channel, options) => {
   const { config, client } = await localClient(); output(channelResult(await channelStatus(client, config, channel, options.session, options.wait)));
 });
 channels.command('leave').option('--daemon', 'Stop the runtime reader before leaving').argument('<channel>', 'Canonical numeric channel', channelId).option('--session <uuid>', 'Chat session UUID').action(async (channel, options) => {
@@ -155,7 +155,7 @@ program.command('send').option('--daemon', 'Use the runtime for acknowledgment a
   }
   else { const input = messageInputSchema.parse({ to: options.to, text: options.text, file_ids: options.attach }); output({ message: await client.send(input, options.idempotencyKey) }); }
 });
-program.command('inbox').option('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID for --channel').option('--wait <seconds>', 'Long poll wait, 0–25 seconds', wait, 25).option('--after <cursor>', 'Replay after this cursor for this call', integer).action(async options => {
+program.command('inbox').option('--channel <channel>', 'Paired numeric channel', channelId).option('--session <uuid>', 'Chat session UUID for --channel').option('--wait <seconds>', 'Long poll wait, 0â€“25 seconds', wait, 25).option('--after <cursor>', 'Replay after this cursor for this call', integer).action(async options => {
   if (options.session && !options.channel) throw new BridgeError(0, 'INVALID_ARGUMENT', '--session requires --channel');
   const { config, client } = await localClient();
   if (options.channel) { const session = requireChannelSession(config, options.channel, options.session); output(await client.channelInbox(session.channel, session.session_id, session.generation, options.after, options.wait)); return; }
