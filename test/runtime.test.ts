@@ -3,12 +3,12 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { createServer as httpServer, request as httpRequest } from 'node:http';
+import { createServer as httpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { setTimeout as pause } from 'node:timers/promises';
-import { DaemonClient, type DaemonInfo } from '../src/client/daemon-client.js';
+import { actorKey, DaemonClient, type DaemonInfo } from '../src/client/daemon-client.js';
 import { RelayClient } from '../src/client/relay.js';
 import { createServer } from '../src/server/server.js';
 
@@ -500,11 +500,63 @@ test('transport retry of an old echo cannot deliver its captured frame to a repl
     const replacementSession = randomUUID();
     const fresh = await b.client.pair('4040', replacementSession, 3000); assert.equal(fresh.verified, true);
     assert.notEqual(fresh.connection!.pairing_id, oldPairing);
-    // RelayClient's first automatic retry waits250 ms. The runtime has already
+    // RelayClient's first automatic retry waits 250 ms. The runtime has already
     // observed and confirmed the replacement before that retry can execute.
     await pause(350);
     const replay = await b.relay.channelInbox('4040', replacementSession, fresh.connection!.generation, 0, 0);
     assert.ok(!replay.messages.some(message => message.text.includes(oldPairing!) && message.text.includes(oldNonce!)), 'An old transport retry was routed to the new peer despite its captured pairing');
     assert.equal((await b.client.status()).channels.find(value => value.channel === '4040')!.pending_messages, 0);
   } finally { echoingSession = undefined; oldPairing = undefined; await Promise.allSettled([obsolete]); }
+});
+
+async function localRpcFixture(t: TestContext, handle: (input: { session_id: string; timeout_ms: number }, request: IncomingMessage, response: ServerResponse) => void) {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-local-rpc-'));
+  const server = httpServer((request, response) => {
+    let body = ''; request.setEncoding('utf8'); request.on('data', chunk => { body += chunk; });
+    request.on('end', () => { handle(JSON.parse(body), request, response); });
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  t.after(async () => { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await rm(directory, { recursive: true, force: true }); });
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const config = { url, token: 'synthetic-relay-token', device: 'rpc-test', roots: {} };
+  const path = join(directory, 'config.json');
+  const info: DaemonInfo = { version: 1, url, token: 'synthetic-local-token-at-least-32-bytes', actor: actorKey(config), pid: process.pid };
+  await writeFile(path, JSON.stringify(config), { mode: 0o600 });
+  await writeFile(`${path}.daemon.json`, JSON.stringify(info), { mode: 0o600 });
+  return new DaemonClient(info, path);
+}
+
+test('long local pair and watch waits hide intermediate timeouts and cap each RPC at 25 seconds', { timeout: 10_000 }, async t => {
+  const requests: { session_id: string; timeout_ms: number }[] = [];
+  const client = await localRpcFixture(t, (input, _request, response) => {
+    requests.push(input);
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ messages: [], cursor: 0, acknowledged_cursor: 0, verified: requests.length > 1, timed_out: requests.length === 1, channel: '4040', session_id: input.session_id, runtime_setup_ms: 0 }));
+  });
+  const session = randomUUID();
+  for (const operation of ['pair', 'watch'] as const) {
+    requests.length = 0;
+    const result = await client[operation]('4040', session, 30_000);
+    assert.equal(result.timed_out, false, 'An intermediate local RPC timeout escaped as the caller result');
+    if (operation === 'pair') assert.equal((result as Awaited<ReturnType<DaemonClient['pair']>>).verified, true);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].timeout_ms, 25_000);
+    assert.ok(requests.every(input => input.session_id === session && input.timeout_ms <= 25_000 && input.timeout_ms > 0));
+  }
+});
+
+test('local reconnection sends only the remaining original pair deadline under the same UUID', { timeout: 10_000 }, async t => {
+  const requests: { session_id: string; timeout_ms: number }[] = [];
+  const client = await localRpcFixture(t, (input, request, response) => {
+    requests.push(input);
+    if (requests.length === 1) { request.socket.destroy(); return; }
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ messages: [], cursor: 0, acknowledged_cursor: 0, verified: true, timed_out: false, channel: '4040', session_id: input.session_id, runtime_setup_ms: 0 }));
+  });
+  const session = randomUUID(), started = performance.now();
+  const result = await client.pair('4040', session, 1000);
+  assert.equal(result.verified, true); assert.equal(requests.length, 2);
+  assert.ok(requests[0].timeout_ms <= 1000 && requests[0].timeout_ms > 0);
+  assert.ok(requests[1].timeout_ms < requests[0].timeout_ms, 'A reconnect reset the original local pair deadline');
+  assert.ok(requests.every(input => input.session_id === session));
+  assert.ok(result.runtime_setup_ms >= 40, 'Reported setup time omitted the earlier reconnection wait');
+  assert.ok(performance.now() - started < 1000);
 });

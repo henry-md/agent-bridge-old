@@ -12,6 +12,7 @@ import test, { type TestContext } from 'node:test';
 import { RelayClient } from '../src/client/relay.js';
 import { watchChannel } from '../src/client/channel.js';
 import type { BridgeConfig } from '../src/client/config.js';
+import { actorKey } from '../src/client/daemon-client.js';
 import type { ChannelStatus } from '../src/shared/protocol.js';
 import { createServer } from '../src/server/server.js';
 
@@ -499,4 +500,40 @@ test('paired watch drains only complete matching acknowledgment pages and bounds
   mode = 'changed-config'; reads = 0; writes = 0;
   await assert.rejects(watchChannel(client, config, '4040', session, 1, connection), (error: any) => error.code === 'CONFIG_CHANGED');
   assert.equal(writes, 0, 'A config change stops automatic acknowledgments');
+});
+
+test('actual daemon CLI formats stalled local pair response and body deadlines as structured errors', { timeout: 10_000 }, async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'bridge-cli-local-deadline-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'config.json');
+  const session = '25535ebb-34f5-4a8d-a8ce-18f0ba3ae7d3';
+  const localToken = 'synthetic-local-runtime-token-at-least-32-bytes';
+  let input: { session_id?: string; timeout_ms?: number } | undefined, respondHeaders = false;
+  const url = await httpFixture(t, (request, response) => {
+    assert.equal(request.url, '/v1/channels/4040/pair');
+    assert.equal(request.headers.authorization, `Bearer ${localToken}`);
+    let body = ''; request.setEncoding('utf8'); request.on('data', chunk => { body += chunk; });
+    request.on('end', () => { input = JSON.parse(body); });
+    if (respondHeaders) { response.writeHead(200, { 'Content-Type': 'application/json' }); response.flushHeaders(); }
+    // Deliberately never answer the authenticated local RPC. The CLI's own
+    // 1.5 second HTTP deadline must terminate this request without a stacktrace.
+  });
+  const config: BridgeConfig = { url, token: 'synthetic-relay-token', device: 'timeout-test', roots: {} };
+  await writeFile(path, JSON.stringify(config), { mode: 0o600 });
+  await writeFile(`${path}.daemon.json`, JSON.stringify({ version: 1, url, token: localToken, pid: process.pid, actor: actorKey(config) }), { mode: 0o600 });
+  for (const headers of [false, true]) {
+    respondHeaders = headers; input = undefined;
+    const started = performance.now();
+    const result = await run(process.execPath, ['dist/cli.js', 'channel', 'pair', '4040', '--daemon', '--session', session, '--timeout', '1'], {
+      cwd: process.cwd(), env: { ...process.env, BRIDGE_CONFIG: path, CODEX_THREAD_ID: session }, timeout: 5000,
+    }).then(() => { throw new Error('Stalled local pair unexpectedly succeeded'); }, error => error as { code: number; stdout: string; stderr: string });
+    assert.equal(result.code, 1); assert.equal(result.stdout, '');
+    assert.ok(performance.now() - started < 4000, 'CLI failed to honor its bounded local request deadline');
+    assert.deepEqual(input, { session_id: session, timeout_ms: 1000 });
+    const lines = result.stderr.trim().split('\n');
+    assert.equal(lines.length, 1, 'Timeout or abort must produce one JSON error instead of an uncaught TypeError stacktrace');
+    const output = JSON.parse(lines[0]);
+    assert.equal(output.error.code, 'REQUEST_TIMEOUT'); assert.equal(typeof output.error.message, 'string'); assert.ok(output.error.message.length);
+    assert.ok(!result.stderr.includes(localToken)); assert.ok(!result.stderr.includes('TypeError'));
+  }
 });

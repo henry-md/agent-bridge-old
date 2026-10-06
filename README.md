@@ -80,6 +80,8 @@ Open the URL from `bridge daemon status`, followed by `/ui?channel=4040`, for a 
 
 Initial setup starts an independent proof when the runtime creates a channel. A hook timing out or a CLI caller disconnecting does not cancel that proof. With `bridge hooks install --pane`, the pane opens while connecting and shows the verified word as soon as the peer arrives. Probe and echo writes run beside the sole reader, so a delayed HTTP receipt cannot strand incoming mail. An authenticated echo of a fresh nonce proves the durable probe without waiting for its outbound POST receipt. Pairing changes rotate the nonce and cancel stale transport retries; acknowledgments wait for earlier unfinished setup replies.
 
+Long local pair/watch calls use RPC windows of at most 25 seconds and retain the original deadline across windows and reconnections. Intermediate timeouts stay internal; transport timeouts produce a structured CLI error without changing membership or acknowledging mail.
+
 HTTP 403 with `channel_session_mismatch` means the session belongs to another authenticated device: each chat must use its own fixed UUID. Two agents testing on one computer also need distinct registered devices and isolated `BRIDGE_CONFIG` files. A plain HTTP 403 without a bridge error code can come from relay URL or network/proxy access and must be diagnosed on the affected computer. After correcting the cause, retry the same session; the runtime recreates a stopped worker.
 
 Do not run a direct `watch` or `inbox` reader alongside the runtime. Use `--daemon` for pair, watch, send-with-ack/watch, ack and leave. Streamed uploads, authenticated downloads, checksums and the outbound file connector retain their existing interfaces.

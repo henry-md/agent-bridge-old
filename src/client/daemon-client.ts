@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { setTimeout as pause } from 'node:timers/promises';
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
+import { performance } from 'node:perf_hooks';
 import { BridgeError, channelIdSchema } from '../shared/protocol.js';
 import { configPath, readConfig, type BridgeConfig } from './config.js';
 import type { ChannelRuntime, RuntimePairResult } from './runtime.js';
@@ -24,11 +25,19 @@ export class DaemonClient {
   async request<T>(path: string, body?: unknown, timeoutMs = 600_500, signal?: AbortSignal): Promise<T> {
     const stop = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs);
     const reconnect = path.endsWith('/watch') || path.endsWith('/pair');
+    const input = reconnect ? sessionBody.parse(body) : undefined;
+    const started = performance.now(), deadline = input ? started + input.timeout_ms : undefined;
     while (true) {
       try {
-        const response = await fetch(this.info.url + path, { method: body === undefined ? 'GET' : 'POST', headers: { Authorization: `Bearer ${this.info.token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, body: body === undefined ? undefined : JSON.stringify(body), signal: stop });
-        const result = await response.json() as { error?: { code: string; message: string } };
+        const remaining = deadline === undefined ? undefined : Math.max(1, Math.ceil(deadline - performance.now()));
+        // Bound local long polls below native fetch's headers timeout. Keep the
+        // caller's original deadline across chunks and daemon reconnections.
+        const requestBody = input ? { ...input, timeout_ms: Math.min(25_000, remaining!) } : body;
+        const response = await fetch(this.info.url + path, { method: body === undefined ? 'GET' : 'POST', headers: { Authorization: `Bearer ${this.info.token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, body: body === undefined ? undefined : JSON.stringify(requestBody), signal: stop });
+        const result = await response.json() as { error?: { code: string; message: string }; timed_out?: boolean; runtime_setup_ms?: number };
         if (!response.ok) throw new BridgeError(response.status, result.error?.code ?? 'DAEMON_ERROR', result.error?.message ?? 'Local daemon request failed');
+        if (input && remaining! > 25_000 && result.timed_out === true) continue;
+        if (input && path.endsWith('/pair') && typeof result.runtime_setup_ms === 'number') result.runtime_setup_ms = performance.now() - started;
         return result as T;
       } catch (error) {
         let retryable = error instanceof TypeError || error instanceof BridgeError && error.code === 'RUNTIME_RESTARTING';

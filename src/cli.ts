@@ -208,7 +208,18 @@ program.command('skill').command('install').option('--project <path>', 'Install 
   output({ installed: resolve(destination, 'SKILL.md'), scope: options.project ? 'project' : options.claude ? 'claude' : 'user' });
 });
 try { await program.parseAsync(); } catch (error) {
-  const commander = error as { code?: string; exitCode?: number };
-  if (commander.code === 'commander.helpDisplayed' || commander.code === 'commander.version') process.exitCode = 0;
-  else { const code = error instanceof BridgeError ? error.code : commander.code ?? 'CLI_ERROR'; const message = error instanceof BridgeError ? error.message : commander.code?.startsWith('commander.') ? (error as Error).message : 'Command failed; check configuration, paths, and arguments'; process.stderr.write(`${JSON.stringify({ error: { code, message } })}\n`); process.exitCode = 1; }
+  const nativeCode = (error as { code?: unknown })?.code;
+  const commandCode = typeof nativeCode === 'string' ? nativeCode : undefined;
+  if (commandCode === 'commander.helpDisplayed' || commandCode === 'commander.version') process.exitCode = 0;
+  else {
+    const timeout = error instanceof Error && error.name === 'TimeoutError';
+    const canceled = error instanceof Error && error.name === 'AbortError';
+    const code = error instanceof BridgeError ? error.code : timeout ? 'REQUEST_TIMEOUT' : canceled ? 'CANCELED' : commandCode ?? 'CLI_ERROR';
+    const message = error instanceof BridgeError ? error.message
+      : timeout ? 'Bridge request exceeded its deadline; retry with the same session.'
+      : canceled ? 'Bridge request canceled; membership and unacknowledged mail are preserved.'
+      : commandCode?.startsWith('commander.') ? (error as Error).message
+      : 'Command failed; check configuration, paths, and arguments';
+    process.stderr.write(`${JSON.stringify({ error: { code, message } })}\n`); process.exitCode = 1;
+  }
 }
