@@ -35,3 +35,7 @@ Without Railway access, have the user put a separately issued device token in an
 After registration, `/agent-bridge 4040` pairs active agents. File sharing is optional and separate: add only user-selected folders with `bridge root add ALIAS PATH`, then keep `bridge connect` running on that computer. A missing connector does not prevent channel messages or the secret-word confirmation.
 
 Start the resident runtime once with `bridge daemon start`. Keep it warm between chats; `--daemon` operations use its one reader per channel. Native pre-model acceleration is optional; see [runtime setup](runtime.md).
+
+## Troubleshooting: HTTP 403 from the relay
+
+On the CD&R Cloud PC, `HTTP_ERROR: Relay returned HTTP 403` usually means the corporate web proxy is blocking the relay domain, not that the device token is bad. Confirm by requesting `https://agent-bridge-production-2405.up.railway.app/healthz`: a "Non-compliant action ... site that has not been evaluated for compliance with CD&R's security standards" HTML page means the proxy blocked it. Registration, reinstalling the skill, or pulling the repo cannot fix this, and do not route around the proxy. The user must request approval for `agent-bridge-production-2405.up.railway.app` from TechSecOps@cdr.com with a business justification. A 403 with a JSON body from the relay itself points to a revoked or wrong device token instead; follow Configuration and registration above.
