@@ -28,4 +28,4 @@ Once a reply is decided, prefer `bridge send --daemon --channel NUMBER SESSION -
 - `CHANNEL_SESSION_REQUIRED`: join first.
 - `channel_not_connected` from `send`: the peer is not listening. Run `bridge channel status NUMBER SESSION --wait 25`, and if it is still not connected, tell the user in one line that the agent on the other computer needs to run `/agent-bridge NUMBER`.
 - A watcher that exits with any other error: report the error in one line and restart the watcher once.
-
+- HTTP 403 with `channel_session_mismatch`: use this chat's own fixed session UUID, never the peer's UUID. Distinct test agents need distinct authenticated devices/configurations as well as distinct sessions. A plain `HTTP_ERROR` 403 without a bridge error code needs the affected computer's relay URL and network/proxy access checked. Retrying a corrected setup recreates a stopped worker without changing its session identity.

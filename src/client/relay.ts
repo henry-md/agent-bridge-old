@@ -51,7 +51,13 @@ export class RelayClient {
           if (retry && transient.has(response.status) && body.error?.code !== 'device_offline' && attempt < 3) {
             await delay(Math.min(3000, 250 * 2 ** attempt), init.signal ?? undefined); continue;
           }
-          throw new BridgeError(response.status, body.error?.code ?? 'HTTP_ERROR', body.error?.message ?? `Relay returned HTTP ${response.status}`);
+          const code = body.error?.code ?? 'HTTP_ERROR';
+          const message = code === 'channel_session_mismatch'
+            ? 'This session belongs to another device. Use this chat\'s own session UUID, not the peer\'s session UUID.'
+            : response.status === 403 && code === 'HTTP_ERROR'
+              ? 'Relay returned HTTP 403 without a bridge error code. Check this computer\'s relay URL and network or proxy access.'
+              : body.error?.message ?? `Relay returned HTTP ${response.status}`;
+          throw new BridgeError(response.status, code, message);
         }
         return response;
       } catch (error) {

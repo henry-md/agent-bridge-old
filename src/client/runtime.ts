@@ -13,7 +13,8 @@ const frameSchema = z.object({ version: z.literal(2), kind: z.enum(['probe', 'ec
 type Frame = z.infer<typeof frameSchema>;
 const identity = (status: ChannelStatus) => `${status.generation}/${status.pairing_id}/${status.peer?.session_id ?? ''}`;
 interface Proof { message: ChannelMessage; connection: ChannelStatus; rtt: number }
-interface Probe { nonce: string; signal: AbortSignal; identity?: string; seq?: number; started?: number; inFlight?: Promise<void>; candidate?: Proof; proof?: Proof }
+interface Probe { nonce: string; signal: AbortSignal; attempt?: AbortController; identity?: string; seq?: number; started?: number; inFlight?: Promise<void>; candidate?: Proof; proof?: Proof }
+interface ControlReceipt { seq: number; processed: boolean; work?: Promise<void> }
 export interface RuntimePairResult extends ChannelInbox {
   verified: boolean; timed_out: boolean; channel: string; session_id: string; proof_nonce?: string; proof_message_id?: string; proof_round_trip_ms?: number; runtime_setup_ms: number;
 }
@@ -22,13 +23,15 @@ export interface RuntimePairResult extends ChannelInbox {
 // ordinary records stay durable and unacknowledged until the agent processes them.
 export class ChannelRuntime {
   private readonly controller = new AbortController();
+  private pairing = new AbortController();
   private readonly changes = new EventEmitter();
   private readonly ordinary = new Map<string, ChannelMessage>();
   private readonly probes = new Map<string, Probe>();
+  private readonly controls = new Map<string, ControlReceipt>();
+  private readonly sends = new Set<Promise<void>>();
   private connection?: ChannelStatus;
   private cursor = 0;
   private acknowledged = 0;
-  private acknowledgmentBlocked = false;
   private failure?: unknown;
   private transport: 'connecting' | 'online' | 'reconnecting' | 'stopped' = 'connecting';
   private verifiedAt?: string;
@@ -47,12 +50,51 @@ export class ChannelRuntime {
     try {
       while (true) {
         try { this.connection = await joinChannel(this.client, this.config, this.channel, this.session, 0, this.controller.signal); return; }
-        catch (error) { if (this.controller.signal.aborted || !this.retryable(error)) throw error; this.transport = 'reconnecting'; await pause(100, undefined, { signal: this.controller.signal }); }
+        catch (error) { if (this.controller.signal.aborted || !this.recoverable(error)) throw error; this.transport = 'reconnecting'; await pause(100, undefined, { signal: this.controller.signal }); }
       }
     }
     catch (error) { this.failure = error; this.transport = 'stopped'; this.changes.emit('change'); throw error; }
   }
   private retryable(error: unknown) { return error instanceof BridgeError ? error.status >= 500 || error.status === 429 && error.code !== 'RUNTIME_MAILBOX_FULL' : error instanceof TypeError || error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name); }
+  private recoverable(error: unknown) { return this.retryable(error) || error instanceof BridgeError && ['channel_not_connected', 'channel_pairing_changed', 'channel_session_expired', 'stale_generation'].includes(error.code); }
+  private background(work: Promise<void>) {
+    this.sends.add(work);
+    void work.catch(error => {
+      if (!this.controller.signal.aborted && !this.recoverable(error)) { this.failure = error; this.controller.abort(); }
+    }).finally(() => { this.sends.delete(work); this.changes.emit('change'); });
+  }
+  private queueProcessedControls() {
+    const firstOrdinary = Math.min(Infinity, ...[...this.ordinary.values()].map(message => message.seq));
+    let cursor = this.acknowledged;
+    for (const receipt of [...this.controls.values()].sort((a, b) => a.seq - b.seq)) {
+      if (receipt.seq <= this.acknowledged) continue;
+      if (!receipt.processed || receipt.seq >= firstOrdinary) break;
+      cursor = receipt.seq;
+    }
+    if (cursor > this.acknowledged) this.queueControlAck(this.connection!.generation, cursor);
+  }
+  private receiveControl(message: ChannelMessage, write?: () => Promise<unknown>) {
+    if (this.controls.has(message.id)) return;
+    const receipt: ControlReceipt = { seq: message.seq, processed: !write }; this.controls.set(message.id, receipt);
+    if (write) {
+      receipt.work = (async () => {
+      while (!this.controller.signal.aborted) {
+        try { await write(); break; }
+        catch (error) {
+          if (this.controller.signal.aborted) return;
+          // A changed pairing invalidates the old setup exchange. A new nonce
+          // proves the new peer; never send the old control to that peer.
+          if (error instanceof BridgeError && ['channel_not_connected', 'channel_pairing_changed', 'channel_session_expired', 'stale_generation'].includes(error.code)) break;
+          if (!this.retryable(error)) throw error;
+          await pause(100, undefined, { signal: this.controller.signal });
+        }
+      }
+      if (this.controller.signal.aborted || this.controls.get(message.id) !== receipt) return;
+      receipt.processed = true; this.queueProcessedControls();
+      })();
+      this.background(receipt.work);
+    }
+  }
   private async credentials() {
     const current = await readConfig();
     if (current.url !== this.config.url || current.token !== this.config.token || current.device !== this.config.device) throw new BridgeError(0, 'CONFIG_CHANGED', 'Relay credentials changed; restart the local runtime with the new configuration');
@@ -66,8 +108,13 @@ export class ChannelRuntime {
   private update(status: ChannelStatus) {
     if (status.channel !== this.channel || status.session_id !== this.session) throw new BridgeError(0, 'CHANNEL_IDENTITY_MISMATCH', 'Relay returned a different channel or session');
     if (this.connection && identity(this.connection) !== identity(status)) {
+      this.pairing.abort(); this.pairing = new AbortController();
       this.verifiedAt = undefined;
-      for (const probe of this.probes.values()) { probe.identity = undefined; probe.seq = undefined; probe.candidate = undefined; probe.proof = undefined; }
+      for (const [nonce, probe] of [...this.probes]) {
+        probe.attempt?.abort(); probe.inFlight = undefined;
+        this.probes.delete(nonce); probe.nonce = randomUUID(); this.probes.set(probe.nonce, probe);
+        probe.identity = undefined; probe.seq = undefined; probe.candidate = undefined; probe.proof = undefined;
+      }
     }
     this.connection = status;
   }
@@ -85,14 +132,19 @@ export class ChannelRuntime {
   }
   private async send(frame: Frame, key: string, signal = this.controller.signal) {
     await this.credentials();
-    const sent = await this.client.sendChannel(this.channel, { session_id: this.session, generation: frame.generation, text: prefix + JSON.stringify(frame), file_ids: [] }, key, signal);
+    const current = this.connection!;
+    if (frame.generation !== current.generation || frame.pairing_id !== current.pairing_id || frame.from_session !== this.session || frame.to_session !== current.peer?.session_id) throw new BridgeError(409, 'channel_pairing_changed', 'Peer changed before sending the setup frame');
+    const sent = await this.client.sendChannel(this.channel, { session_id: this.session, generation: frame.generation, text: prefix + JSON.stringify(frame), file_ids: [] }, key, AbortSignal.any([signal, this.pairing.signal]));
     if (sent.to_session !== frame.to_session) throw new BridgeError(409, 'channel_pairing_changed', 'Peer changed while sending the setup frame');
     return sent;
   }
   private complete(probe: Probe) {
-    if (probe.signal.aborted) return;
+    if (probe.signal.aborted || probe.proof) return;
     const candidate = probe.candidate;
-    if (candidate && probe.seq !== undefined && candidate.message.seq > probe.seq && probe.identity === identity(candidate.connection) && probe.identity === identity(this.connection!)) {
+    // The authenticated peer can echo this unpredictable nonce only after it
+    // receives our durable probe. Its echo is proof even if our POST receipt
+    // is delayed; do not wait for that receipt before showing the word.
+    if (candidate && probe.started !== undefined && (probe.seq === undefined || candidate.message.seq > probe.seq) && probe.identity === identity(candidate.connection) && probe.identity === identity(this.connection!)) {
       probe.proof = { ...candidate, rtt: performance.now() - probe.started! }; this.verifiedAt = new Date().toISOString(); this.proofMs = probe.proof.rtt; this.changes.emit('change');
     }
   }
@@ -104,12 +156,15 @@ export class ChannelRuntime {
     const tuple = identity(status);
     if (probe.identity === tuple && probe.seq !== undefined) return;
     probe.identity = tuple; probe.candidate = undefined; probe.proof = undefined; probe.started = performance.now();
-    probe.inFlight = (async () => {
-      const sent = await this.send({ version: 2, kind: 'probe', nonce: probe.nonce, generation: status.generation, pairing_id: status.pairing_id, from_session: this.session, to_session: status.peer!.session_id, word: status.secret_word }, `runtime-probe:${probe.nonce}:${status.pairing_id}`, probe.signal);
+    const attempt = new AbortController(); probe.attempt = attempt;
+    const stop = AbortSignal.any([probe.signal, attempt.signal]);
+    const work = (async () => {
+      const sent = await this.send({ version: 2, kind: 'probe', nonce: probe.nonce, generation: status.generation, pairing_id: status.pairing_id, from_session: this.session, to_session: status.peer!.session_id, word: status.secret_word }, `runtime-probe:${probe.nonce}:${status.pairing_id}`, stop);
       await this.credentials();
       if (probe.identity === tuple) { probe.seq = sent.seq; this.complete(probe); }
     })();
-    try { await probe.inFlight; } finally { probe.inFlight = undefined; }
+    probe.inFlight = work;
+    try { await work; } finally { if (probe.inFlight === work) probe.inFlight = undefined; }
   }
   private async loop() {
     try {
@@ -118,45 +173,45 @@ export class ChannelRuntime {
         try {
           this.check();
           await this.credentials();
-          for (const probe of this.probes.values()) await this.submit(probe);
+          for (const probe of this.probes.values()) this.background(this.submit(probe));
           const status = this.connection!;
           const page = await this.client.channelInbox(this.channel, this.session, status.generation, this.cursor || undefined, 25, true, this.controller.signal);
           await this.credentials();
           this.update(page.connection ?? await this.client.channelStatus(this.channel, this.session, status.generation, 0, this.controller.signal));
           this.transport = 'online'; this.acknowledged = Math.max(this.acknowledged, page.acknowledged_cursor);
           for (const [id, message] of this.ordinary) if (message.seq <= this.acknowledged) this.ordinary.delete(id);
-          if (!this.ordinary.size) this.acknowledgmentBlocked = false;
+          for (const [id, receipt] of this.controls) if (receipt.seq <= this.acknowledged) this.controls.delete(id);
           const snapshot = this.connection!;
-          let prefixCursor = this.acknowledged;
           for (const message of page.messages) {
             if (message.seq <= this.acknowledged) continue;
             const frame = this.control(message, snapshot);
             if (!frame) {
               if (this.ordinary.size >= 1000 && !this.ordinary.has(message.id)) throw new BridgeError(429, 'RUNTIME_MAILBOX_FULL', 'Process the queued mailbox before restarting the runtime reader');
-              this.ordinary.set(message.id, message); this.acknowledgmentBlocked = true; continue;
+              this.ordinary.set(message.id, message); continue;
             }
             if (frame === 'legacy-probe') {
-              await this.credentials();
-              const reply = await this.client.sendChannel(this.channel, { session_id: this.session, generation: snapshot.generation, text: `agent-bridge setup ack: ${snapshot.secret_word}`, file_ids: [] }, `runtime-legacy:${message.id}`, this.controller.signal);
-              if (reply.to_session !== snapshot.peer?.session_id) throw new BridgeError(409, 'channel_pairing_changed', 'Peer changed while replying to legacy setup');
+              this.receiveControl(message, async () => {
+                await this.credentials();
+                if (identity(snapshot) !== identity(this.connection!)) throw new BridgeError(409, 'channel_pairing_changed', 'Peer changed before replying to legacy setup');
+                const reply = await this.client.sendChannel(this.channel, { session_id: this.session, generation: snapshot.generation, text: `agent-bridge setup ack: ${snapshot.secret_word}`, file_ids: [] }, `runtime-legacy:${message.id}`, AbortSignal.any([this.controller.signal, this.pairing.signal]));
+                if (reply.to_session !== snapshot.peer?.session_id) throw new BridgeError(409, 'channel_pairing_changed', 'Peer changed while replying to legacy setup');
+              });
             } else if (typeof frame !== 'string' && frame.kind === 'probe') {
-              await this.send({ ...frame, kind: 'echo', from_session: this.session, to_session: frame.from_session }, `runtime-echo:${message.id}`);
+              this.receiveControl(message, () => this.send({ ...frame, kind: 'echo', from_session: this.session, to_session: frame.from_session }, `runtime-echo:${message.id}`));
             } else if (typeof frame !== 'string') {
               await this.credentials();
               const probe = this.probes.get(frame.nonce);
               if (probe && probe.identity === identity(snapshot)) { probe.candidate = { message, connection: snapshot, rtt: 0 }; this.complete(probe); }
-            }
-            if (!this.acknowledgmentBlocked) prefixCursor = message.seq;
+              this.receiveControl(message);
+            } else this.receiveControl(message);
           }
           this.cursor = Math.max(page.cursor, this.acknowledged);
           // Wake proof callers before the optional receipt commit. The nonce
           // frame itself is already in the durable authenticated mailbox.
           this.changes.emit('change');
-          if (prefixCursor > this.acknowledged) {
-            this.queueControlAck(snapshot.generation, prefixCursor);
-          }
+          this.queueProcessedControls();
           if (snapshot.peer && snapshot.status !== 'connected') this.update(await this.client.confirmChannel(this.channel, this.session, snapshot.generation, snapshot.secret_word, snapshot.pairing_id, this.controller.signal));
-          for (const probe of this.probes.values()) await this.submit(probe);
+          for (const probe of this.probes.values()) this.background(this.submit(probe));
           this.changes.emit('change');
         } catch (error) {
           if (this.controller.signal.aborted) break;
@@ -171,7 +226,7 @@ export class ChannelRuntime {
             try { renewed = await joinChannel(this.client, this.config, this.channel, this.session, 0, this.controller.signal); }
             catch (refresh) { if (!this.retryable(refresh)) throw refresh; this.transport = 'reconnecting'; await pause(100, undefined, { signal: this.controller.signal }); continue; }
             this.update(renewed);
-            this.cursor = 0; this.acknowledged = 0; this.verifiedAt = undefined; continue;
+            this.cursor = 0; this.acknowledged = 0; this.controls.clear(); this.verifiedAt = undefined; continue;
           }
           if (!this.retryable(error)) throw error;
           this.transport = 'reconnecting'; this.verifiedAt = undefined; this.changes.emit('change');
@@ -230,13 +285,12 @@ export class ChannelRuntime {
     const started = performance.now(), deadline = AbortSignal.timeout(timeoutMs), stop = signal ? AbortSignal.any([deadline, signal, this.controller.signal]) : AbortSignal.any([deadline, this.controller.signal]);
     const timedOut = (): RuntimePairResult => ({ messages: [], cursor: 0, acknowledged_cursor: 0, verified: false, timed_out: true, channel: this.channel, session_id: this.session, runtime_setup_ms: performance.now() - started });
     await this.until(this.ready, stop);
-    if (stop.aborted) return timedOut();
+    if (stop.aborted) { this.check(); return timedOut(); }
     this.check();
     this.verifiedAt = undefined; this.changes.emit('change');
     const probe: Probe = { nonce: randomUUID(), signal: stop }; this.probes.set(probe.nonce, probe);
     try {
-      try { await this.until(this.submit(probe), stop); }
-      catch (error) { if (!this.retryable(error) && !(error instanceof BridgeError && ['channel_not_connected', 'channel_pairing_changed'].includes(error.code))) throw error; }
+      this.background(this.submit(probe));
       while (!stop.aborted) {
         this.check();
         await this.credentials();
@@ -246,12 +300,12 @@ export class ChannelRuntime {
         }
         await this.changed(stop);
       }
-      return timedOut();
+      this.check(); return timedOut();
     } finally { this.probes.delete(probe.nonce); }
   }
   inbox(): ChannelInbox {
     const messages = [...this.ordinary.values()].sort((a, b) => a.seq - b.seq).slice(0, 100);
-    return { messages, cursor: this.ordinary.size > messages.length ? messages.at(-1)!.seq : this.cursor, acknowledged_cursor: this.acknowledged, ...(this.connection ? { connection: this.connection } : {}) };
+    return { messages, cursor: messages.at(-1)?.seq ?? this.acknowledged, acknowledged_cursor: this.acknowledged, ...(this.connection ? { connection: this.connection } : {}) };
   }
   async watch(timeoutMs: number, signal?: AbortSignal) {
     const stop = signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs), this.controller.signal]) : AbortSignal.any([AbortSignal.timeout(timeoutMs), this.controller.signal]);
@@ -262,13 +316,20 @@ export class ChannelRuntime {
   async acknowledge(cursor: number) {
     await this.ready; await this.credentials();
     if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > this.inbox().cursor) throw new BridgeError(400, 'INVALID_CURSOR', 'Cursor is beyond this runtime inbox');
-    const ack = await this.client.acknowledgeChannel(this.channel, this.session, this.connection!.generation, cursor);
+    const generation = this.connection!.generation;
+    // Ordinary mail can be processed while a setup reply is still sending.
+    // Its acknowledgment must not erase that durable reply obligation.
+    await Promise.all([...this.controls.values()].filter(receipt => receipt.seq <= cursor && !receipt.processed).map(receipt => receipt.work!));
+    this.check(); await this.credentials();
+    if (this.connection!.generation !== generation) throw new BridgeError(409, 'stale_generation', 'The acknowledgment belongs to an earlier generation');
+    const ack = await this.client.acknowledgeChannel(this.channel, this.session, generation, cursor);
     this.acknowledged = Math.max(this.acknowledged, ack.acknowledged_cursor);
     for (const [id, message] of this.ordinary) if (message.seq <= this.acknowledged) this.ordinary.delete(id);
-    if (!this.ordinary.size) this.acknowledgmentBlocked = false;
+    for (const [id, receipt] of this.controls) if (receipt.seq <= this.acknowledged) this.controls.delete(id);
+    this.queueProcessedControls();
     this.changes.emit('change'); return ack;
   }
   status() { return { channel: this.channel, session_id: this.session, connection: this.connection, transport: this.transport, verified_at: this.verifiedAt ?? null, pending_messages: this.ordinary.size, proof_round_trip_ms: this.proofMs ?? null }; }
   onChange(listener: () => void) { this.changes.on('change', listener); return () => this.changes.off('change', listener); }
-  async close(reason = 'RUNTIME_RESTARTING') { this.closeReason = reason; this.controller.abort(); if (this.ackTimer) clearTimeout(this.ackTimer); this.changes.emit('change'); await this.work; await this.ackWork; }
+  async close(reason = 'RUNTIME_RESTARTING') { this.closeReason = reason; this.controller.abort(); if (this.ackTimer) clearTimeout(this.ackTimer); this.changes.emit('change'); await this.work; await this.ackWork; await Promise.allSettled(this.sends); }
 }

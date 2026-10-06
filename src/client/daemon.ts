@@ -60,14 +60,18 @@ export async function runDaemon(onReady?: (info: Omit<DaemonInfo, 'token'>) => v
   async function worker(channel: string, session: string, create: boolean) {
     return serialize(channel, async () => {
       const current = workers.get(channel);
-      if (current?.session === session) return current;
+      if (current?.session === session && current.status().transport !== 'stopped') return current;
       if (!create) throw new BridgeError(409, 'channel_session_replaced', 'This channel belongs to a different chat or has not been paired');
       if (current) await current.close('channel_session_replaced');
       const fresh = await updateConfig(current => {
         if (!current || current.url !== config.url || current.token !== config.token || current.device !== config.device) throw new BridgeError(0, 'CONFIG_CHANGED', 'Restart the runtime after changing credentials');
         return { ...current, runtime: { ...current.runtime!, channels: { ...current.runtime!.channels, [channel]: session } } };
       });
-      const next = new ChannelRuntime(new RelayClient(fresh.url, fresh.token!), fresh, channel, session); workers.set(channel, next); next.onChange(publish); return next;
+      const next = new ChannelRuntime(new RelayClient(fresh.url, fresh.token!), fresh, channel, session); workers.set(channel, next); next.onChange(publish);
+      // Keep initial proof alive after a bounded hook or CLI caller disconnects.
+      // The live pane can then show the verified word as soon as the peer joins.
+      void next.pair(600_000).catch(() => {});
+      return next;
     });
   }
   app.get('/ui', async (_request, reply) => reply.header('Cache-Control', 'no-store').header('X-Content-Type-Options', 'nosniff').header('Content-Security-Policy', "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'").type('text/html').send(bridgePane));
@@ -132,9 +136,7 @@ export async function runDaemon(onReady?: (info: Omit<DaemonInfo, 'token'>) => v
     });
     await writePrivateJson(file, { version: 1, url, token, pid: process.pid, actor });
     for (const [channel, session] of Object.entries(config.runtime!.channels)) {
-      const runtime = await worker(channel, session, true);
-      // Restoration never counts a cached word as proof.
-      void runtime.pair(600_000).catch(() => {});
+      await worker(channel, session, true);
     }
     onReady?.({ version: 1, url, pid: process.pid, actor });
     const stop = () => { void shutdown(); }; process.once('SIGINT', stop); process.once('SIGTERM', stop);

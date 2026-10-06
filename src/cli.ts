@@ -47,7 +47,7 @@ async function runtimeSession(channel: string, explicit?: string) {
   await updateConfig(current => { if (!current || current.url !== config.url || current.token !== config.token || current.device !== config.device) throw new BridgeError(0, 'CONFIG_CHANGED', 'Credentials changed while reserving runtime identity'); const saved = current.channel_sessions?.[channel] ?? { sessions: {} }; return { ...current, channel_sessions: { ...current.channel_sessions, [channel]: { ...saved, fallback_session_id: saved.fallback_session_id ?? created } } }; });
   return (await readConfig()).channel_sessions![channel].fallback_session_id!;
 }
-program.command('hooks').command('install').option('--pane', 'Open the live pane after a fresh verified prompt').action(async options => { const { installHooks } = await import('./client/hooks.js'); output(await installHooks(fileURLToPath(import.meta.url), !!options.pane)); });
+program.command('hooks').command('install').option('--pane', 'Open the live pane immediately for bridge prompts').action(async options => { const { installHooks } = await import('./client/hooks.js'); output(await installHooks(fileURLToPath(import.meta.url), !!options.pane)); });
 const configuration = program.command('config').description('Configure local credentials outside Git');
 configuration.command('set').requiredOption('--url <url>', 'Relay HTTPS origin').option('--token-env <variable>', 'Environment variable holding a device token').option('--device <name>', 'Device name').action(async options => {
   const url = validateRelayUrl(options.url);

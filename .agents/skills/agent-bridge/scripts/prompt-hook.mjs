@@ -38,17 +38,20 @@ try {
       }
       if (!local) throw Error('runtime unavailable');
       const channel = match[1], deadline = Math.max(1, 1200 - (performance.now() - started));
+      const pane = `${local.url}/ui?channel=${channel}`;
+      // Open while connecting so the independent runtime proof can update the
+      // word immediately, even if the peer arrives after this hook's deadline.
+      if (process.argv.includes('--pane')) {
+        if (process.platform === 'darwin') launch('/usr/bin/open', [pane]);
+        else if (process.platform === 'win32') launch('rundll32.exe', ['url.dll,FileProtocolHandler', pane]);
+        else launch('xdg-open', [pane]);
+      }
       const response = await fetch(`${local.url}/v1/channels/${channel}/pair`, { method: 'POST', headers: { Authorization: `Bearer ${local.token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: input.session_id, timeout_ms: Math.floor(deadline) }), signal: AbortSignal.timeout(Math.floor(deadline) + 100) });
       const result = await response.json();
       if (response.ok && result.verified === true && result.session_id === input.session_id && result.channel === channel && uuid.test(result.proof_nonce ?? '') && uuid.test(result.proof_message_id ?? '') && /^[a-z0-9-]{3,80}$/.test(result.connection?.secret_word ?? '')) {
         // Recheck local account identity before injecting verified context.
         const current = await info(); if (current.actor !== local.actor) throw Error('identity changed');
-        const word = result.connection.secret_word, pane = `${local.url}/ui?channel=${channel}`;
-        if (process.argv.includes('--pane')) {
-          if (process.platform === 'darwin') launch('/usr/bin/open', [pane]);
-          else if (process.platform === 'win32') launch('rundll32.exe', ['url.dll,FileProtocolHandler', pane]);
-          else launch('xdg-open', [pane]);
-        }
+        const word = result.connection.secret_word;
         emit({ continue: true, systemMessage: `Connected on channel ${channel}. Secret word is ${word}.`, hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: `Agent Bridge runtime already joined this chat (${input.session_id}) on channel ${channel} and verified a fresh echoed nonce through the durable message channel. Secret word: ${word}. Proof took ${result.proof_round_trip_ms.toFixed(1)} ms. Pane: ${pane}. Show the verified word and reuse any existing watcher for this channel/session. If none is running, use bridge watch --daemon --channel ${channel} --session ${input.session_id} --timeout 600. Keep listening; do not pair again or start a second relay reader. Ordinary messages remain unacknowledged and must be processed through the skill.` } });
       }
     }
